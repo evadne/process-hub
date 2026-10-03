@@ -179,16 +179,30 @@ defmodule ProcessHub.Strategy.Synchronization.Gossip do
             [struct()],
             keyword()
           ) :: :ok
-    def propagate(strategy, hub, requests, _opts) when is_list(requests) do
+    def propagate(strategy, hub, requests, opts) when is_list(requests) do
       ref = make_ref()
-      Gossip.handle_request_propagation(hub.hub_id, requests)
+      members = Keyword.get(opts, :members, :global)
+      local_node = node()
 
-      Cluster.nodes(hub.storage.misc)
+      if members in [:global, :local] or
+           (is_list(members) and Enum.member?(members, local_node)) do
+        Gossip.handle_request_propagation(hub.hub_id, requests)
+      end
+
+      hub.storage.misc
+      |> Cluster.nodes()
+      |> target_nodes(members)
       |> Gossip.recipients_select(strategy)
       |> Gossip.propagate_data(hub, strategy, {ref, [node()], requests})
 
       :ok
     end
+
+    defp target_nodes(nodes, members) when members in [:global, :external], do: nodes
+    defp target_nodes(_nodes, :local), do: []
+
+    defp target_nodes(nodes, members) when is_list(members),
+      do: Enum.filter(nodes, &(&1 in members))
 
     @impl true
     @spec init_sync(ProcessHub.Strategy.Synchronization.Gossip.t(), Hub.t(), [node()]) ::

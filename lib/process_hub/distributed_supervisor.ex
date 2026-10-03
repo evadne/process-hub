@@ -9,6 +9,7 @@ defmodule ProcessHub.DistributedSupervisor do
 
   alias ProcessHub.Service.ProcessRegistry
   alias ProcessHub.Service.Dispatcher
+  alias ProcessHub.Request.CrossNodeRequest
   alias ProcessHub.Request.Handler.PidsUnregisterRequest
   alias ProcessHub.Request.Handler.PidUpdateRequest
 
@@ -27,9 +28,9 @@ defmodule ProcessHub.DistributedSupervisor do
   as the base module, this way we can overwrite the `handle_info/2` function
   on the `:supervisor` module to handle the `:EXIT` messages our selves.
   """
-  def start_link({hub_id, dsup_name, max_restarts, max_seconds}) do
+  def start_link({hub, dsup_name, max_restarts, max_seconds}) do
     args = %{
-      hub_id: hub_id,
+      hub: hub,
       max_restarts: max_restarts,
       max_seconds: max_seconds
     }
@@ -47,11 +48,11 @@ defmodule ProcessHub.DistributedSupervisor do
 
   def init(args) do
     # Store hub_id in process dictionary for later retrieval
-    Process.put(:hub_id, args.hub_id)
+    Process.put(:hub, args.hub)
     Process.put(@pd_cid_to_pid, %{})
 
     children =
-      args.hub_id
+      args.hub.hub_id
       |> children()
       |> Enum.map(&wrap_child_spec/1)
 
@@ -161,40 +162,38 @@ defmodule ProcessHub.DistributedSupervisor do
   end
 
   defp handle_child_exit(child_id, old_pid) do
-    hub_id = Process.get(:hub_id)
+    hub = Process.get(:hub)
     new_pid = Process.get(@pd_cid_to_pid, %{}) |> Map.get(child_id)
 
     cond do
       is_pid(new_pid) and new_pid !== old_pid ->
-        dispatch_child_event(hub_id, :propagate_child_restart, [child_id, new_pid])
+        propagate_child_restart(hub, child_id, new_pid)
 
       is_nil(new_pid) ->
         Process.send(self(), {:delete_child_spec, child_id}, [])
-        dispatch_child_event(hub_id, :propagate_child_removal, [child_id])
+        propagate_child_removal(hub, child_id)
 
       true ->
         nil
     end
   end
 
-  # Never synchronously call the coordinator from the supervisor's EXIT callback:
-  # which_children/2 calls the supervisor from that coordinator, so crossed calls
-  # would deadlock both processes after the child had already gone away.
-  defp dispatch_child_event(hub_id, callback, args) do
-    GenServer.cast(hub_id, {:exec_cast, {__MODULE__, callback, args}})
-  end
-
-  @doc false
-  def propagate_child_removal(hub, child_id) do
+  # Apply the local lifecycle decision without involving the coordinator. The
+  # coordinator's child census calls this supervisor synchronously, so a reverse
+  # call would deadlock; an unacknowledged cast would instead be lost if that
+  # coordinator were replaced. The event queue remains an independent path to
+  # peers, while the local registry change commits before this callback returns.
+  defp propagate_child_removal(hub, child_id) do
     request = PidsUnregisterRequest.new([{child_id, [node()]}], on_empty: :delete)
 
-    Dispatcher.propagate_event(hub, request, members: :global)
+    CrossNodeRequest.handle(request, hub)
+    Dispatcher.propagate_event(hub, request, members: :external)
   end
 
-  @doc false
-  def propagate_child_restart(hub, child_id, new_pid) do
+  defp propagate_child_restart(hub, child_id, new_pid) do
     request = PidUpdateRequest.new(child_id, node(), new_pid)
 
-    Dispatcher.propagate_event(hub, request, members: :global)
+    CrossNodeRequest.handle(request, hub)
+    Dispatcher.propagate_event(hub, request, members: :external)
   end
 end

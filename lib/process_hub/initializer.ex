@@ -6,6 +6,7 @@ defmodule ProcessHub.Initializer do
   """
 
   alias :blockade, as: Blockade
+  alias ProcessHub.Hub
   alias ProcessHub.Service.Recovery
   alias ProcessHub.Service.LoggerService
 
@@ -137,7 +138,7 @@ defmodule ProcessHub.Initializer do
         {Registry, keys: :unique, name: procs.system_registry},
         {ProcessHub.Service.ProcessRegistry, {hub_id, procs.process_registry}},
         {Blockade, %{name: procs.event_queue, priority_sync: false}},
-        dist_sup(hub_conf, procs),
+        dist_sup(hub_conf, procs, storage),
         {Task.Supervisor, name: procs.task_sup}
       ] ++
         ProcessHub.Storage.RemoteManifest.Shipper.child_specs(
@@ -164,9 +165,11 @@ defmodule ProcessHub.Initializer do
     Supervisor.init(children, opts)
   end
 
-  defp dist_sup(%ProcessHub{} = hub, procs) do
+  defp dist_sup(%ProcessHub{} = hub, procs, storage) do
+    lifecycle_hub = %Hub{hub_id: hub.hub_id, procs: procs, storage: storage}
+
     args = {
-      hub.hub_id,
+      lifecycle_hub,
       procs.dist_sup,
       hub.dsup_max_restarts,
       hub.dsup_max_seconds
