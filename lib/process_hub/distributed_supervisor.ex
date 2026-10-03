@@ -9,7 +9,8 @@ defmodule ProcessHub.DistributedSupervisor do
 
   alias ProcessHub.Service.ProcessRegistry
   alias ProcessHub.Service.Dispatcher
-  alias ProcessHub.Request.CrossNodeRequest
+  alias ProcessHub.Service.HookManager
+  alias ProcessHub.Constant.Hook
   alias ProcessHub.Request.Handler.PidsUnregisterRequest
   alias ProcessHub.Request.Handler.PidUpdateRequest
 
@@ -185,15 +186,47 @@ defmodule ProcessHub.DistributedSupervisor do
   # peers, while the local registry change commits before this callback returns.
   defp propagate_child_removal(hub, child_id) do
     request = PidsUnregisterRequest.new([{child_id, [node()]}], on_empty: :delete)
+    registered? = ProcessRegistry.lookup(hub.hub_id, child_id) != nil
 
-    CrossNodeRequest.handle(request, hub)
+    ProcessRegistry.bulk_delete(hub.hub_id, request.removable_cid_nodes, on_empty: :delete)
+
+    if registered? do
+      dispatch_lifecycle_hooks(hub, [
+        {Hook.child_unregistered(), %{child_id: child_id}}
+      ])
+    end
+
     Dispatcher.propagate_event(hub, request, members: :external)
   end
 
   defp propagate_child_restart(hub, child_id, new_pid) do
     request = PidUpdateRequest.new(child_id, node(), new_pid)
 
-    CrossNodeRequest.handle(request, hub)
+    case ProcessRegistry.lookup(hub.hub_id, child_id, with_metadata: true) do
+      nil ->
+        nil
+
+      {child_spec, node_pids, metadata} ->
+        updated_node_pids = Keyword.put(node_pids, node(), new_pid)
+
+        ProcessRegistry.insert(hub.hub_id, child_spec, updated_node_pids, metadata: metadata)
+
+        dispatch_lifecycle_hooks(hub, [
+          {Hook.child_registered(), %{child_id: child_id, node_pids: updated_node_pids}},
+          {Hook.child_pid_updated(), %{node: node(), pid: new_pid}}
+        ])
+    end
+
     Dispatcher.propagate_event(hub, request, members: :external)
+  end
+
+  # Registry mutations run synchronously so the supervisor's lifecycle decision
+  # is committed before it accepts another child request. User hooks cannot run
+  # in that call chain: a hook is allowed to inspect this supervisor and would
+  # otherwise create supervisor -> registry -> hook -> supervisor. An unlinked
+  # notifier preserves the existing eventual hook delivery without that edge.
+  defp dispatch_lifecycle_hooks(hub, hooks) do
+    spawn(fn -> HookManager.dispatch_hooks(hub.storage.hook, hooks) end)
+    :ok
   end
 end
