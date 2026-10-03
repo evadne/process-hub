@@ -47,6 +47,52 @@ defmodule Test.Service.DistributedSupervisorTest do
     assert Supervisor.which_children(hub.procs.dist_sup) === []
   end
 
+  test "self shutdown cannot deadlock a concurrent child census", %{hub: hub} do
+    child_id = :self_shutdown_during_census
+
+    child_spec = %{
+      id: child_id,
+      start: {Test.Helper.TestServer, :start_link, [%{name: child_id}]},
+      restart: :transient
+    }
+
+    assert %ProcessHub.StartResult{status: :ok} =
+             ProcessHub.start_child(@hub_id, child_spec, awaitable: true)
+             |> Future.await()
+
+    child_pid = ProcessHub.get_pid(@hub_id, child_id)
+    dist_sup = hub.procs.dist_sup
+    dist_sup_pid = GenServer.whereis(dist_sup)
+
+    # Fix the mailbox order which exposed the field failure: the child's EXIT is
+    # ahead of the coordinator's synchronous Supervisor.which_children/1 call.
+    :ok = :sys.suspend(dist_sup)
+    :ok = GenServer.stop(child_pid, :normal)
+    census = Task.async(fn -> ProcessHub.which_children(@hub_id, [:local]) end)
+
+    assert eventually_message?(dist_sup_pid, fn
+             {:EXIT, ^child_pid, :normal} -> true
+             _ -> false
+           end)
+
+    assert eventually_message?(dist_sup_pid, fn
+             {:"$gen_call", _from, :which_children} -> true
+             _ -> false
+           end)
+
+    :ok = :sys.resume(dist_sup)
+
+    assert {_, _children} = Task.await(census, 2_000)
+
+    assert Test.Helper.Common.eventually(fn ->
+             dist_sup
+             |> Supervisor.which_children()
+             |> Enum.all?(fn {id, _, _, _} -> id !== child_id end)
+           end)
+
+    assert Test.Helper.Common.eventually(fn -> ProcessHub.get_pid(@hub_id, child_id) == nil end)
+  end
+
   test "terminate_child stops and removes child from supervisor", %{hub: hub} do
     child_spec = %{
       id: :term_child_test,
@@ -73,6 +119,27 @@ defmodule Test.Service.DistributedSupervisorTest do
 
     # Verify child is fully removed from supervisor (not just stopped)
     assert Supervisor.which_children(hub.procs.dist_sup) === []
+  end
+
+  defp eventually_message?(pid, matcher, timeout \\ 1_000) do
+    deadline = System.monotonic_time(:millisecond) + timeout
+    wait_for_message(pid, matcher, deadline)
+  end
+
+  defp wait_for_message(pid, matcher, deadline) do
+    messages = Process.info(pid, :messages) |> elem(1)
+
+    cond do
+      Enum.any?(messages, matcher) ->
+        true
+
+      System.monotonic_time(:millisecond) >= deadline ->
+        false
+
+      true ->
+        Process.sleep(5)
+        wait_for_message(pid, matcher, deadline)
+    end
   end
 
   test "terminate_child returns error for non-existent child", %{hub: hub} do

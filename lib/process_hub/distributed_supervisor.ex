@@ -9,7 +9,6 @@ defmodule ProcessHub.DistributedSupervisor do
 
   alias ProcessHub.Service.ProcessRegistry
   alias ProcessHub.Service.Dispatcher
-  alias ProcessHub.Coordinator
   alias ProcessHub.Request.Handler.PidsUnregisterRequest
   alias ProcessHub.Request.Handler.PidUpdateRequest
 
@@ -163,43 +162,37 @@ defmodule ProcessHub.DistributedSupervisor do
 
   defp handle_child_exit(child_id, old_pid) do
     hub_id = Process.get(:hub_id)
+    new_pid = Process.get(@pd_cid_to_pid, %{}) |> Map.get(child_id)
 
-    hub =
-      try do
-        Coordinator.get_hub(hub_id)
-      catch
-        :exit, _ -> nil
-      end
+    cond do
+      is_pid(new_pid) and new_pid !== old_pid ->
+        dispatch_child_event(hub_id, :propagate_child_restart, [child_id, new_pid])
 
-    if hub do
-      new_pid = Process.get(@pd_cid_to_pid, %{}) |> Map.get(child_id)
+      is_nil(new_pid) ->
+        Process.send(self(), {:delete_child_spec, child_id}, [])
+        dispatch_child_event(hub_id, :propagate_child_removal, [child_id])
 
-      cond do
-        is_pid(new_pid) and new_pid !== old_pid ->
-          handle_child_restart(hub, child_id, new_pid)
-
-        is_nil(new_pid) ->
-          handle_child_removal(hub, child_id)
-
-        true ->
-          nil
-      end
+      true ->
+        nil
     end
   end
 
-  # Reached only when the supervisor declined to restart the child — a
-  # `:temporary` child, or a `:transient` one after a normal exit. Its restart
-  # policy has decided the child is done, so the row is removed rather than left
-  # as a churn stub.
-  defp handle_child_removal(hub, child_id) do
+  # Never synchronously call the coordinator from the supervisor's EXIT callback:
+  # which_children/2 calls the supervisor from that coordinator, so crossed calls
+  # would deadlock both processes after the child had already gone away.
+  defp dispatch_child_event(hub_id, callback, args) do
+    GenServer.cast(hub_id, {:exec_cast, {__MODULE__, callback, args}})
+  end
+
+  @doc false
+  def propagate_child_removal(hub, child_id) do
     request = PidsUnregisterRequest.new([{child_id, [node()]}], on_empty: :delete)
 
     Dispatcher.propagate_event(hub, request, members: :global)
-
-    Process.send(self(), {:delete_child_spec, child_id}, [])
   end
 
-  defp handle_child_restart(hub, child_id, new_pid) do
+  @doc false
+  def propagate_child_restart(hub, child_id, new_pid) do
     request = PidUpdateRequest.new(child_id, node(), new_pid)
 
     Dispatcher.propagate_event(hub, request, members: :global)
