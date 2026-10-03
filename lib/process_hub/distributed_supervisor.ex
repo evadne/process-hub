@@ -9,7 +9,10 @@ defmodule ProcessHub.DistributedSupervisor do
 
   alias ProcessHub.Service.ProcessRegistry
   alias ProcessHub.Service.Dispatcher
+  alias ProcessHub.Service.HookManager
+  alias ProcessHub.Constant.Hook
   alias ProcessHub.Coordinator
+  alias ProcessHub.Hub
   alias ProcessHub.Request.Handler.PidsUnregisterRequest
   alias ProcessHub.Request.Handler.PidUpdateRequest
 
@@ -29,8 +32,14 @@ defmodule ProcessHub.DistributedSupervisor do
   on the `:supervisor` module to handle the `:EXIT` messages our selves.
   """
   def start_link({hub_id, dsup_name, max_restarts, max_seconds}) do
+    hub = Coordinator.get_hub(hub_id)
+    start_link_with_hub({hub, dsup_name, max_restarts, max_seconds})
+  end
+
+  @doc false
+  def start_link_with_hub({%Hub{} = hub, dsup_name, max_restarts, max_seconds}) do
     args = %{
-      hub_id: hub_id,
+      hub: hub,
       max_restarts: max_restarts,
       max_seconds: max_seconds
     }
@@ -47,12 +56,12 @@ defmodule ProcessHub.DistributedSupervisor do
   def init({sup, mod, args}), do: :supervisor.init({sup, mod, args})
 
   def init(args) do
-    # Store hub_id in process dictionary for later retrieval
-    Process.put(:hub_id, args.hub_id)
+    # Keep lifecycle dependencies independent of the replaceable coordinator.
+    Process.put(:hub, args.hub)
     Process.put(@pd_cid_to_pid, %{})
 
     children =
-      args.hub_id
+      args.hub.hub_id
       |> children()
       |> Enum.map(&wrap_child_spec/1)
 
@@ -162,46 +171,70 @@ defmodule ProcessHub.DistributedSupervisor do
   end
 
   defp handle_child_exit(child_id, old_pid) do
-    hub_id = Process.get(:hub_id)
+    hub = Process.get(:hub)
+    new_pid = Process.get(@pd_cid_to_pid, %{}) |> Map.get(child_id)
 
-    hub =
-      try do
-        Coordinator.get_hub(hub_id)
-      catch
-        :exit, _ -> nil
-      end
+    cond do
+      is_pid(new_pid) and new_pid !== old_pid ->
+        propagate_child_restart(hub, child_id, new_pid)
 
-    if hub do
-      new_pid = Process.get(@pd_cid_to_pid, %{}) |> Map.get(child_id)
+      is_nil(new_pid) ->
+        Process.send(self(), {:delete_child_spec, child_id}, [])
+        propagate_child_removal(hub, child_id)
 
-      cond do
-        is_pid(new_pid) and new_pid !== old_pid ->
-          handle_child_restart(hub, child_id, new_pid)
-
-        is_nil(new_pid) ->
-          handle_child_removal(hub, child_id)
-
-        true ->
-          nil
-      end
+      true ->
+        nil
     end
   end
 
-  # Reached only when the supervisor declined to restart the child — a
-  # `:temporary` child, or a `:transient` one after a normal exit. Its restart
-  # policy has decided the child is done, so the row is removed rather than left
-  # as a churn stub.
-  defp handle_child_removal(hub, child_id) do
+  # Apply the local lifecycle decision without involving the coordinator. The
+  # coordinator's child census calls this supervisor synchronously, so a reverse
+  # call would deadlock; an unacknowledged cast would instead be lost if that
+  # coordinator were replaced. The event queue remains an independent path to
+  # peers, while the local registry change commits before this callback returns.
+  defp propagate_child_removal(hub, child_id) do
     request = PidsUnregisterRequest.new([{child_id, [node()]}], on_empty: :delete)
+    registered? = ProcessRegistry.lookup(hub.hub_id, child_id) != nil
 
-    Dispatcher.propagate_event(hub, request, members: :global)
+    ProcessRegistry.bulk_delete(hub.hub_id, request.removable_cid_nodes, on_empty: :delete)
 
-    Process.send(self(), {:delete_child_spec, child_id}, [])
+    if registered? do
+      dispatch_lifecycle_hooks(hub, [
+        {Hook.child_unregistered(), %{child_id: child_id}}
+      ])
+    end
+
+    Dispatcher.propagate_event(hub, request, members: :external)
   end
 
-  defp handle_child_restart(hub, child_id, new_pid) do
+  defp propagate_child_restart(hub, child_id, new_pid) do
     request = PidUpdateRequest.new(child_id, node(), new_pid)
 
-    Dispatcher.propagate_event(hub, request, members: :global)
+    case ProcessRegistry.lookup(hub.hub_id, child_id, with_metadata: true) do
+      nil ->
+        nil
+
+      {child_spec, node_pids, metadata} ->
+        updated_node_pids = Keyword.put(node_pids, node(), new_pid)
+
+        ProcessRegistry.insert(hub.hub_id, child_spec, updated_node_pids, metadata: metadata)
+
+        dispatch_lifecycle_hooks(hub, [
+          {Hook.child_registered(), %{child_id: child_id, node_pids: updated_node_pids}},
+          {Hook.child_pid_updated(), %{node: node(), pid: new_pid}}
+        ])
+    end
+
+    Dispatcher.propagate_event(hub, request, members: :external)
+  end
+
+  # Registry mutations run synchronously so the supervisor's lifecycle decision
+  # is committed before it accepts another child request. User hooks cannot run
+  # in that call chain: a hook is allowed to inspect this supervisor and would
+  # otherwise create supervisor -> registry -> hook -> supervisor. An unlinked
+  # notifier preserves the existing eventual hook delivery without that edge.
+  defp dispatch_lifecycle_hooks(hub, hooks) do
+    spawn(fn -> HookManager.dispatch_hooks(hub.storage.hook, hooks) end)
+    :ok
   end
 end

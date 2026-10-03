@@ -149,6 +149,32 @@ defmodule Test.Strategy.Synchronization.GossipTest do
     end
   end
 
+  describe "propagate/4 member scope" do
+    test "external propagation excludes the local coordinator", %{hub: hub} do
+      Storage.insert(hub.storage.misc, StorageKey.hn(), [node()])
+      Process.register(self(), hub.hub_id)
+
+      assert :ok =
+               SynchronizationStrategy.propagate(%Gossip{}, hub, [:external_request],
+                 members: :external
+               )
+
+      refute_receive {_event, [:external_request]}, 100
+    end
+
+    test "local propagation includes the local coordinator", %{hub: hub} do
+      Storage.insert(hub.storage.misc, StorageKey.hn(), [node()])
+      Process.register(self(), hub.hub_id)
+
+      assert :ok =
+               SynchronizationStrategy.propagate(%Gossip{}, hub, [:local_request],
+                 members: :local
+               )
+
+      assert_receive {_event, [:local_request]}, 100
+    end
+  end
+
   describe "struct defaults" do
     test "default values" do
       g = %Gossip{}
